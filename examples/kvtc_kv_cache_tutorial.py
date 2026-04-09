@@ -15,35 +15,27 @@
 """
 KVTC + LMCache offline Engine tutorial
 
-This script assumes it stays at ``examples/kvtc_kv_cache_tutorial.py`` under the
-SGLang repo. The repository root is ``Path(__file__).resolve().parent.parent``.
-
-You pass two config paths:
-
-  * **LMCache (SGLang)**: YAML read via ``LMCACHE_CONFIG_FILE`` — CPU KV offload
-    settings for LMCache.
-  * **KVTC**: JSON read via ``KVTC_JSON_CONFIG_PATH`` — KV compression recipe
-    (omit with ``--no-kvtc`` for LMCache-only).
-
-**KVTC ``mini_examples`` JSON** (``kvtc/src/kvtc/integration/LMCache/configs/mini_examples/``) — quick reference:
-
-- ``mini_kvtc_keys_without_rope_x20_noquant.json`` — default ``--kvtc-json``. Full KVTC (LRPCA + NVComp); ``NoQuant`` (no FP8 quant module); ``rope_overrides`` Neox; ``kvtc_worst_compression_rate`` 20.
-
-- ``mini_kvtc_keys_without_rope_x20.json`` — same family; adds ``Quantization_kvtc-0`` (FP8): PCA + quant + NVComp; heavier, often smaller on disk.
-
-- ``mini_kvtc_keys_with_rope_x20.json`` — x20 + quant; no top-level ``rope_overrides``; pair with the ``with_rope`` tensor layout / model family (not blindly interchangeable with ``without_rope``).
-
-- ``mini_kvtc_keys_without_rope.json`` / ``mini_kvtc_keys_with_rope.json`` — **4×** tier (``kvtc_worst_compression_rate`` 4); ``without_rope`` has ``rope_overrides``, ``with_rope`` does not.
-
-Example::
+Quick start (online calibration, no pre-trained KVTC config needed)::
 
   python examples/kvtc_kv_cache_tutorial.py \\
-    --lmcache-config python/sglang/srt/mem_cache/storage/lmcache/example_config.yaml \\
-    --kvtc-json kvtc/src/kvtc/integration/LMCache/configs/mini_examples/mini_kvtc_keys_without_rope_x20_noquant.json
+    --lmcache-config path/to/lmcache.yaml \\
+    --kvtc-json path/to/mini_kvtc_keys_without_rope_x20.json
 
-NVTX ranges are always emitted (``torch.cuda.nvtx``). To capture them with Nsight Systems::
+With offline-calibrated KVTC config (better compression quality)::
 
-  nsys profile -o kvtc_tutorial --trace=cuda,nvtx python examples/kvtc_kv_cache_tutorial.py
+  python examples/kvtc_kv_cache_tutorial.py \\
+    --lmcache-config path/to/lmcache.yaml \\
+    --kvtc-json path/to/calibrated_kvtc_config.json
+
+LMCache-only (no KVTC compression)::
+
+  python examples/kvtc_kv_cache_tutorial.py \\
+    --lmcache-config path/to/lmcache.yaml --no-kvtc
+
+NVTX profiling::
+
+  nsys profile -o kvtc_tutorial --trace=cuda,nvtx \\
+    python examples/kvtc_kv_cache_tutorial.py ...
 """
 
 from __future__ import annotations
@@ -141,12 +133,7 @@ def parse_args() -> argparse.Namespace:
     default_lmcache = (
         _REPO_ROOT / "python/sglang/srt/mem_cache/storage/lmcache/example_config.yaml"
     )
-    default_kvtc = (
-        _REPO_ROOT
-        / "kvtc/src/kvtc/integration/LMCache/configs/mini_examples"
-        / "mini_kvtc_keys_without_rope_x20.json" #high acc
-        # / "mini_kvtc_keys_without_rope_x20_noquant.json" #fast
-    )
+    default_kvtc = None
 
     parser = argparse.ArgumentParser(
         description="KVTC + LMCache tutorial: pass LMCache YAML and KVTC JSON paths."
@@ -161,9 +148,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kvtc-json",
         type=str,
-        default=str(default_kvtc),
+        default=default_kvtc,
         help="Path to KVTC JSON (sets KVTC_JSON_CONFIG_PATH). "
-        f"Default: mini example under kvtc/.... Ignored if --no-kvtc.",
+        "Required unless --no-kvtc is set.",
     )
     parser.add_argument(
         "--no-kvtc",
@@ -210,6 +197,8 @@ def main() -> None:
     lmcache_cfg = setup_lmcache_env(Path(args.lmcache_config))
     print(f"LMCache (SGLang) YAML -> LMCACHE_CONFIG_FILE={lmcache_cfg}")
 
+    if not args.no_kvtc and args.kvtc_json is None:
+        raise SystemExit("Error: --kvtc-json is required unless --no-kvtc is set.")
     kvtc_path: Optional[Path] = None if args.no_kvtc else Path(args.kvtc_json)
     setup_kvtc_env(kvtc_path)
     if args.no_kvtc:
