@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import supports_nvenc
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
@@ -31,7 +32,6 @@ def can_encode_while_decoding(
     """Rank-independent eligibility, including ranks that only decode audio/video."""
     return (
         batch.save_output
-        and not envs.SGLANG_USE_NVENC.get()
         and batch.return_file_paths_only
         and not batch.return_raw_frames
         and not (batch.extra or {}).get("retain_decoded_frames", False)
@@ -43,6 +43,9 @@ def can_encode_while_decoding(
         and not server_args.enable_torch_compile
         and type(server_args.pipeline_config).post_decoding
         is PipelineConfig.post_decoding
+        and (
+            not envs.SGLANG_USE_NVENC.get() or not supports_nvenc(batch.latents.device)
+        )
     )
 
 

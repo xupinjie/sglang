@@ -4,19 +4,49 @@
 from __future__ import annotations
 
 import io
+import logging
 import math
 import os
 import threading
 from collections import OrderedDict
+from functools import lru_cache
 from typing import Any
 
 import torch
 
+logger = logging.getLogger(__name__)
 _MAX_IDLE_SESSIONS = 4
 _idle_sessions: OrderedDict[tuple[int, int, int, int, int], _NvencSession] = (
     OrderedDict()
 )
 _cache_lock = threading.Lock()
+
+
+@lru_cache(maxsize=None)
+def _device_has_nvenc(pid: int, gpu_id: int) -> bool:
+    try:
+        import PyNvVideoCodec as nvc
+
+        caps = nvc.GetEncoderCaps(gpu_id, "h264")
+        supported = int(caps.get("num_encoder_engines", 0)) > 0
+    except Exception as exc:
+        message = str(exc).splitlines()
+        logger.warning(
+            "Cannot query NVENC on CUDA device %d; using CPU encoding: %s",
+            gpu_id,
+            message[0] if message else type(exc).__name__,
+        )
+        return False
+    if not supported:
+        logger.warning("CUDA device %d has no H.264 NVENC; using CPU encoding", gpu_id)
+    return supported
+
+
+def supports_nvenc(device: torch.device) -> bool:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    gpu_id = device.index if device.index is not None else torch.cuda.current_device()
+    return _device_has_nvenc(os.getpid(), gpu_id)
 
 
 class _NvencSession:
@@ -99,6 +129,8 @@ class NvencVideoEncoder:
         cq = int((1 - quality / 10) * 51)
         if cq == 0:  # NVENC CQ=0 is automatic quality, not x264 lossless CRF=0.
             return None
+        if not supports_nvenc(device):
+            return None
         gpu_id = (
             device.index if device.index is not None else torch.cuda.current_device()
         )
@@ -152,7 +184,7 @@ class NvencVideoEncoder:
         self._muxer.SetUniformPtsIncrement(timebase // fps)
 
     def write(self, frames: torch.Tensor) -> None:
-        """Encode [3, T, H, W] CUDA RGB frames in [0, 1]."""
+        """Encode [3, T, H, W] CUDA RGB frames, either uint8 or in [0, 1]."""
         if self._finished:
             raise RuntimeError("NVENC video encoder is closed")
         if frames.dim() == 3:
@@ -174,7 +206,11 @@ class NvencVideoEncoder:
         chunk_frames = max(1, min(4, (64 * 1024 * 1024) // frame_bytes))
         with torch.cuda.device(self._device), torch.cuda.stream(stream):
             for chunk in frames.split(chunk_frames, dim=1):
-                rgb = (chunk * 255).clamp_(0, 255).to(torch.uint8)
+                rgb = (
+                    chunk
+                    if chunk.dtype == torch.uint8
+                    else (chunk * 255).clamp_(0, 255).to(torch.uint8)
+                )
                 rgb = rgb.permute(1, 2, 3, 0)
                 rgba = torch.empty(
                     (*rgb.shape[:-1], 4), dtype=torch.uint8, device=self._device
