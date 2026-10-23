@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -30,6 +31,7 @@ def can_encode_while_decoding(
     """Rank-independent eligibility, including ranks that only decode audio/video."""
     return (
         batch.save_output
+        and not envs.SGLANG_USE_NVENC.get()
         and batch.return_file_paths_only
         and not batch.return_raw_frames
         and not (batch.extra or {}).get("retain_decoded_frames", False)

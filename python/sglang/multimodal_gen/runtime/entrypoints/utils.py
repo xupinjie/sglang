@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -662,7 +663,7 @@ def _try_save_cuda_video_direct(
     output_compression: Optional[int],
     x264_preset: Optional[str] = None,
 ) -> bool:
-    """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
+    """Save CUDA RGB video with NVENC or the CPU ffmpeg writer."""
     video, audio = _split_sample_audio(sample)
     if not (
         isinstance(video, torch.Tensor)
@@ -678,7 +679,15 @@ def _try_save_cuda_video_direct(
     _, num_frames, height, width = video.shape
     encoder = None
     try:
-        encoder = CudaVideoEncoder.open(
+        if envs.SGLANG_USE_NVENC.get():
+            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+                NvencVideoEncoder,
+            )
+
+            encoder_type = NvencVideoEncoder
+        else:
+            encoder_type = CudaVideoEncoder
+        encoder = encoder_type.open(
             save_file_path,
             device=video.device,
             height=height,
@@ -699,6 +708,8 @@ def _try_save_cuda_video_direct(
     except Exception:
         if encoder is not None:
             encoder.abort()
+        if envs.SGLANG_USE_NVENC.get():
+            raise
         logger.warning_once(
             "Direct CUDA video save failed; falling back to CPU ffmpeg encoding. "
             "Enable debug logging for exception details."
@@ -717,7 +728,11 @@ def _try_save_cuda_videos_direct(
     x264_preset: Optional[str] = None,
 ) -> list[bool] | None:
     """Save independent CUDA videos concurrently when memory permits."""
-    if len(samples) < 2 or len(samples) != len(save_file_paths):
+    if (
+        envs.SGLANG_USE_NVENC.get()
+        or len(samples) < 2
+        or len(samples) != len(save_file_paths)
+    ):
         return None
 
     videos = []
