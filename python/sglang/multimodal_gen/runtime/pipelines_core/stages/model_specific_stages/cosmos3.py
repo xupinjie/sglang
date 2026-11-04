@@ -2722,7 +2722,7 @@ class Cosmos3DecodingStage(PipelineStage):
                     _maybe_mux_audio_into_mp4(
                         save_file_path=output_file_paths[0],
                         audio=audio,
-                        frames=range(int(decoded.shape[2])),
+                        num_frames=int(decoded.shape[2]),
                         fps=batch.fps,
                         audio_sample_rate=audio_sample_rate,
                     )

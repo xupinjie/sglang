@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -662,48 +663,125 @@ def _try_save_cuda_video_direct(
     output_compression: Optional[int],
     x264_preset: Optional[str] = None,
 ) -> bool:
-    """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
+    """Save video with NVENC or the CUDA-to-CPU ffmpeg writer."""
     video, audio = _split_sample_audio(sample)
-    if not (
+    use_nvenc = envs.SGLANG_USE_NVENC.get()
+    numpy_frames = (
+        use_nvenc
+        and isinstance(video, np.ndarray)
+        and video.ndim == 4
+        and video.shape[-1] in (1, 3, 4)
+        and video.dtype in (np.uint8, np.float16, np.float32, np.float64)
+    )
+    list_frames = (
+        use_nvenc and _is_numpy_frame_list(video) and video[0].dtype == np.uint8
+    )
+    tensor_frames = (
         isinstance(video, torch.Tensor)
-        and video.device.type == "cuda"
         and video.dim() in (3, 4)
-    ):
+        and video.shape[0] == 3
+        and (video.device.type == "cuda" or use_nvenc)
+    )
+    if not (numpy_frames or list_frames or tensor_frames):
         return False
-    if video.dim() == 3:
-        video = video.unsqueeze(1)
-    if video.shape[0] != 3:
-        return False
+    if use_nvenc and (numpy_frames or list_frames or video.device.type == "cpu"):
+        if not torch.cuda.is_available():
+            return False
 
-    _, num_frames, height, width = video.shape
+    if numpy_frames or list_frames:
+        if numpy_frames:
+            num_frames, height, width, _ = video.shape
+            element_size = video.itemsize
+        else:
+            num_frames = len(video)
+            height, width = video[0].shape[:2]
+            element_size = 1
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        if video.dim() == 3:
+            video = video.unsqueeze(1)
+        _, num_frames, height, width = video.shape
+        element_size = video.element_size()
+        device = (
+            video.device
+            if video.device.type == "cuda"
+            else torch.device("cuda", torch.cuda.current_device())
+        )
     encoder = None
+    using_nvenc = False
     try:
-        encoder = CudaVideoEncoder.open(
-            save_file_path,
-            device=video.device,
+        encoder_kwargs = dict(
+            device=device,
             height=height,
             width=width,
             fps=fps,
             num_frames=num_frames,
-            element_size=video.element_size(),
+            element_size=element_size,
             audio=audio,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
             x264_preset=x264_preset,
         )
+        if use_nvenc:
+            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+                NvencVideoEncoder,
+            )
+
+            encoder = NvencVideoEncoder.open(
+                save_file_path, **{**encoder_kwargs, "audio": None}
+            )
+            using_nvenc = encoder is not None
         if encoder is None:
-            return False
-        encoder.write(video)
+            if not (tensor_frames and video.device.type == "cuda"):
+                return False
+            encoder = CudaVideoEncoder.open(save_file_path, **encoder_kwargs)
+            if encoder is None:
+                return False
+        if using_nvenc and (numpy_frames or list_frames or video.device.type == "cpu"):
+            chunk_frames = max(
+                1,
+                min(
+                    4,
+                    (64 * 1024 * 1024) // (height * width * max(element_size, 4) * 3),
+                ),
+            )
+            for start in range(0, num_frames, chunk_frames):
+                end = min(start + chunk_frames, num_frames)
+                if numpy_frames or list_frames:
+                    rgb = np.ascontiguousarray(
+                        video[start:end] if numpy_frames else np.stack(video[start:end])
+                    )
+                    if rgb.ndim == 3:
+                        rgb = rgb[..., None]
+                    if rgb.shape[-1] == 1:
+                        rgb = np.repeat(rgb, 3, axis=-1)
+                    elif rgb.shape[-1] == 4:
+                        rgb = np.ascontiguousarray(rgb[..., :3])
+                    chunk = torch.from_numpy(rgb).to(device).permute(3, 0, 1, 2)
+                else:
+                    chunk = video[:, start:end].to(device)
+                encoder.write(chunk)
+        else:
+            encoder.write(video)
         encoder.close()
+        if using_nvenc and audio is not None:
+            _maybe_mux_audio_into_mp4(
+                save_file_path=save_file_path,
+                audio=audio,
+                num_frames=num_frames,
+                fps=fps,
+                audio_sample_rate=audio_sample_rate,
+            )
         return True
     except Exception:
         if encoder is not None:
             encoder.abort()
         logger.warning_once(
-            "Direct CUDA video save failed; falling back to CPU ffmpeg encoding. "
-            "Enable debug logging for exception details."
+            "%s video save failed; falling back to CPU ffmpeg encoding. "
+            "Enable debug logging for exception details.",
+            "NVENC" if using_nvenc else "Direct CUDA",
         )
-        logger.debug("Direct CUDA video save failure", exc_info=True)
+        logger.debug("Direct video save failure", exc_info=True)
         return False
 
 
@@ -717,7 +795,11 @@ def _try_save_cuda_videos_direct(
     x264_preset: Optional[str] = None,
 ) -> list[bool] | None:
     """Save independent CUDA videos concurrently when memory permits."""
-    if len(samples) < 2 or len(samples) != len(save_file_paths):
+    if (
+        envs.SGLANG_USE_NVENC.get()
+        or len(samples) < 2
+        or len(samples) != len(save_file_paths)
+    ):
         return None
 
     videos = []
@@ -845,7 +927,7 @@ def _maybe_mux_audio_into_mp4(
     *,
     save_file_path: str,
     audio: Any,
-    frames: list,
+    num_frames: int,
     fps: int,
     audio_sample_rate: Optional[int],
 ) -> None:
@@ -860,7 +942,7 @@ def _maybe_mux_audio_into_mp4(
         audio_np=audio_np,
         audio_sample_rate=audio_sample_rate,
         fps=fps,
-        num_frames=len(frames),
+        num_frames=num_frames,
     )
 
     try:
@@ -1075,7 +1157,9 @@ def attach_audio_to_video_sample(
     audio = select_output_audio(audio, output_idx)
     if audio is None:
         return sample
-    if not (isinstance(sample, (tuple, list)) and len(sample) == 2):
+    if _is_numpy_frame_list(sample) or not (
+        isinstance(sample, (tuple, list)) and len(sample) == 2
+    ):
         return (sample, audio)
     return sample
 
@@ -1088,7 +1172,27 @@ def select_output_audio(audio: Any, output_idx: int) -> Any:
     return audio
 
 
+def _is_numpy_frame_list(sample: Any) -> bool:
+    return (
+        isinstance(sample, list)
+        and bool(sample)
+        and isinstance(sample[0], np.ndarray)
+        and (
+            sample[0].ndim == 2
+            or (sample[0].ndim == 3 and sample[0].shape[-1] in (1, 3, 4))
+        )
+        and all(
+            isinstance(frame, np.ndarray)
+            and frame.shape == sample[0].shape
+            and frame.dtype == sample[0].dtype
+            for frame in sample
+        )
+    )
+
+
 def _split_sample_audio(sample: Any) -> tuple[Any, Any]:
+    if _is_numpy_frame_list(sample):
+        return sample, None
     if isinstance(sample, (tuple, list)) and len(sample) == 2:
         return sample[0], sample[1]
     return sample, None
@@ -1096,6 +1200,13 @@ def _split_sample_audio(sample: Any) -> tuple[Any, Any]:
 
 def _sample_to_uint8_frames(sample: Any) -> list[Any]:
     """return numpy frames in THCW format"""
+    if _is_numpy_frame_list(sample):
+        return [
+            frame
+            if frame.dtype == np.uint8
+            else (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+            for frame in sample
+        ]
     if isinstance(sample, torch.Tensor):
         # sample is raw tensor
         if sample.dim() == 3:
@@ -1222,6 +1333,16 @@ def save_materialized_output(
 
     os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
     if data_type == DataType.VIDEO:
+        if envs.SGLANG_USE_NVENC.get() and _try_save_cuda_video_direct(
+            save_file_path=save_file_path,
+            sample=(materialized.frames, materialized.audio),
+            fps=materialized.fps,
+            audio_sample_rate=audio_sample_rate,
+            output_compression=output_compression,
+            x264_preset=x264_preset,
+        ):
+            logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+            return
         quality = output_compression / 10 if output_compression is not None else 5
         saved_with_audio = _try_save_video_with_audio(
             save_file_path=save_file_path,
@@ -1244,7 +1365,7 @@ def save_materialized_output(
             _maybe_mux_audio_into_mp4(
                 save_file_path=save_file_path,
                 audio=materialized.audio,
-                frames=materialized.frames,
+                num_frames=len(materialized.frames),
                 fps=materialized.fps,
                 audio_sample_rate=audio_sample_rate,
             )

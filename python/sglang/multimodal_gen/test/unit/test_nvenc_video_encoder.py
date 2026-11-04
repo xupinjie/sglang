@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A warm output and a different resolution must keep separate NVENC sessions."""
+"""NVENC output, session reuse, and CPU fallback tests."""
 
 import importlib.util
 import sys
@@ -8,8 +8,10 @@ import threading
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import torch
 
 from sglang.test.test_utils import CustomTestCase
@@ -40,6 +42,112 @@ class TestNvencAvailability(CustomTestCase):
                 self.assertFalse(nvenc.supports_nvenc(torch.device("cuda:0")))
         finally:
             nvenc._device_has_nvenc.cache_clear()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_cuda_writer_remains_available_without_nvenc(self):
+        from sglang.multimodal_gen.runtime.entrypoints import (
+            nvenc_video_encoder as nvenc,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints import (
+            utils,
+        )
+        from sglang.srt.environ import envs
+
+        frames = torch.zeros((3, 2, 8, 8), device="cuda")
+        audio = np.zeros(800, np.float32)
+        encoder = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                envs.SGLANG_USE_NVENC.override(True),
+                mock.patch.object(
+                    nvenc.NvencVideoEncoder, "open", return_value=None
+                ) as open_nvenc,
+                mock.patch.object(
+                    utils.CudaVideoEncoder, "open", return_value=encoder
+                ) as open_cuda,
+            ):
+                self.assertTrue(
+                    utils._try_save_cuda_video_direct(
+                        save_file_path=str(Path(directory, "fallback.mp4")),
+                        sample=(frames, audio),
+                        fps=24,
+                        audio_sample_rate=16000,
+                        output_compression=None,
+                    )
+                )
+        self.assertIsNone(open_nvenc.call_args.kwargs["audio"])
+        self.assertIs(open_cuda.call_args.kwargs["audio"], audio)
+        self.assertIs(encoder.write.call_args.args[0], frames)
+        encoder.close.assert_called_once()
+
+    def test_streamed_nvenc_muxes_audio_after_video(self):
+        from sglang.multimodal_gen.runtime.entrypoints import (
+            nvenc_video_encoder as nvenc,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints import (
+            utils,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+            EncodeWhileDecoding,
+        )
+
+        batch = SimpleNamespace(
+            fps=24, num_frames=2, output_compression=None, x264_preset=None
+        )
+        encoder = mock.Mock()
+        audio = np.zeros(800, np.float32)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory, "audio.mp4"))
+            stream = EncodeWhileDecoding(
+                path, batch, audio=audio, audio_sample_rate=16000, use_nvenc=True
+            )
+            with (
+                mock.patch.object(
+                    nvenc.NvencVideoEncoder, "open", return_value=encoder
+                ) as open_nvenc,
+                mock.patch.object(
+                    utils.CudaVideoEncoder,
+                    "open",
+                    side_effect=AssertionError("unexpected CPU encoder"),
+                ),
+                mock.patch.object(utils, "_maybe_mux_audio_into_mp4") as mux_audio,
+            ):
+                stream(torch.zeros((1, 3, 2, 8, 8)))
+                self.assertEqual(stream.finish(), [path])
+        self.assertIsNone(open_nvenc.call_args.kwargs["audio"])
+        encoder.write.assert_called_once()
+        encoder.close.assert_called_once()
+        self.assertEqual(mux_audio.call_args.kwargs["num_frames"], 2)
+        self.assertIs(mux_audio.call_args.kwargs["audio"], audio)
+
+    def test_two_frame_list_with_audio_and_cpu_fallback(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+        from sglang.multimodal_gen.runtime.entrypoints import utils
+        from sglang.srt.environ import envs
+
+        frames = [np.full((8, 8, 3), 128, np.uint8) for _ in range(2)]
+        audio = np.zeros(800, np.float32)
+        sample = utils.attach_audio_to_video_sample(frames, audio, 0)
+        video, selected_audio = utils._split_sample_audio(sample)
+        self.assertIs(video, frames)
+        self.assertIs(selected_audio, audio)
+
+        materialized = utils.MaterializedOutput(
+            sample=sample, frames=frames, audio=audio, fps=24
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory, "fallback.mp4"))
+            with (
+                envs.SGLANG_USE_NVENC.override(True),
+                mock.patch.object(
+                    utils, "_try_save_cuda_video_direct", return_value=False
+                ),
+                mock.patch.object(
+                    utils, "_try_save_video_with_audio", return_value=True
+                ) as cpu_save,
+            ):
+                utils.save_materialized_output(materialized, DataType.VIDEO, path)
+            cpu_save.assert_called_once()
 
 
 @unittest.skipUnless(
@@ -110,6 +218,39 @@ class TestNvencVideoEncoder(CustomTestCase):
         finally:
             with nvenc._cache_lock:
                 nvenc._idle_sessions.clear()
+
+    def test_generic_video_output_uses_nvenc_with_audio(self):
+        import av
+
+        from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+        from sglang.multimodal_gen.runtime.entrypoints import utils
+        from sglang.srt.environ import envs
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        frames = torch.full((3, 4, 256, 256), 0.5, device=device)
+        audio = torch.sin(torch.arange(3200) / 10).float()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "video_audio.mp4")
+            with (
+                envs.SGLANG_USE_NVENC.override(True),
+                mock.patch.object(
+                    utils,
+                    "_save_video_ffmpeg",
+                    side_effect=AssertionError("unexpected CPU encoding"),
+                ),
+            ):
+                utils.save_outputs(
+                    [frames],
+                    DataType.VIDEO,
+                    24,
+                    True,
+                    lambda _idx: str(path),
+                    audio=audio,
+                    audio_sample_rate=16000,
+                )
+            with av.open(str(path)) as container:
+                self.assertEqual(len(list(container.decode(video=0))), 4)
+                self.assertEqual(len(container.streams.audio), 1)
 
     def test_streamed_write_returns_while_nvenc_worker_is_busy(self):
         """Frame submission returns before the NVENC worker finishes."""
@@ -242,7 +383,7 @@ class TestNvencVideoEncoder(CustomTestCase):
             utils._maybe_mux_audio_into_mp4(
                 save_file_path=str(path),
                 audio=audio,
-                frames=range(num_frames),
+                num_frames=num_frames,
                 fps=fps,
                 audio_sample_rate=sample_rate,
             )

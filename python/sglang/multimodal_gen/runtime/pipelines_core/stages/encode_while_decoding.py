@@ -75,6 +75,8 @@ class EncodeWhileDecoding:
         self._use_nvenc = use_nvenc
         self._encoder = None
         self._failed = False
+        self._nvenc_started = False
+        self._encoded_frames = 0
 
     def __call__(self, frames: torch.Tensor) -> None:
         """Encode frames that are [1, 3, t, H, W] in [0, 1] after ``finish_frames``."""
@@ -98,6 +100,7 @@ class EncodeWhileDecoding:
                         self._failed = True
                         return
                 self._encoder.write(chunk)
+                self._encoded_frames += int(chunk.shape[1])
         except Exception:
             self._fail()
 
@@ -125,13 +128,14 @@ class EncodeWhileDecoding:
             try:
                 encoder = NvencVideoEncoder.open(
                     self.save_file_path,
-                    **kwargs,
+                    **{**kwargs, "audio": None},
                     # These queued frames are FP32 until the worker converts them.
                     max_queued_frames=max(
                         1, _STREAMED_VIDEO_QUEUE_BYTES // (12 * height * width)
                     ),
                 )
                 if encoder is not None:
+                    self._nvenc_started = True
                     return encoder
             except Exception:
                 logger.warning_once(
@@ -150,6 +154,18 @@ class EncodeWhileDecoding:
             return None
         try:
             self._encoder.close()
+            if self._nvenc_started and self._audio is not None:
+                from sglang.multimodal_gen.runtime.entrypoints.utils import (
+                    _maybe_mux_audio_into_mp4,
+                )
+
+                _maybe_mux_audio_into_mp4(
+                    save_file_path=self.save_file_path,
+                    audio=self._audio,
+                    num_frames=self._encoded_frames,
+                    fps=self._batch.fps,
+                    audio_sample_rate=self._audio_sample_rate,
+                )
         except Exception:
             self._fail()
             return None
