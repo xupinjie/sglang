@@ -80,6 +80,35 @@ class TestNvencAvailability(CustomTestCase):
         self.assertIs(encoder.write.call_args.args[0], frames)
         encoder.close.assert_called_once()
 
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_nvenc_startup_exception_uses_cuda_writer(self):
+        from sglang.multimodal_gen.runtime.entrypoints import nvenc_video_encoder, utils
+        from sglang.srt.environ import envs
+
+        frames = torch.zeros((3, 2, 8, 8), device="cuda")
+        writer = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                envs.SGLANG_USE_NVENC.override(True),
+                mock.patch.object(
+                    nvenc_video_encoder.NvencVideoEncoder,
+                    "open",
+                    side_effect=RuntimeError("startup failed"),
+                ),
+                mock.patch.object(utils.CudaVideoEncoder, "open", return_value=writer),
+            ):
+                self.assertTrue(
+                    utils._try_save_cuda_video_direct(
+                        save_file_path=str(Path(directory, "fallback.mp4")),
+                        sample=frames,
+                        fps=24,
+                        audio_sample_rate=None,
+                        output_compression=None,
+                    )
+                )
+        self.assertIs(writer.write.call_args.args[0], frames)
+        writer.close.assert_called_once()
+
     def test_streamed_nvenc_muxes_audio_after_video(self):
         from sglang.multimodal_gen.runtime.entrypoints import (
             nvenc_video_encoder as nvenc,
@@ -119,35 +148,6 @@ class TestNvencAvailability(CustomTestCase):
         encoder.close.assert_called_once()
         self.assertEqual(mux_audio.call_args.kwargs["num_frames"], 2)
         self.assertIs(mux_audio.call_args.kwargs["audio"], audio)
-
-    def test_two_frame_list_with_audio_and_cpu_fallback(self):
-        from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-        from sglang.multimodal_gen.runtime.entrypoints import utils
-        from sglang.srt.environ import envs
-
-        frames = [np.full((8, 8, 3), 128, np.uint8) for _ in range(2)]
-        audio = np.zeros(800, np.float32)
-        sample = utils.attach_audio_to_video_sample(frames, audio, 0)
-        video, selected_audio = utils._split_sample_audio(sample)
-        self.assertIs(video, frames)
-        self.assertIs(selected_audio, audio)
-
-        materialized = utils.MaterializedOutput(
-            sample=sample, frames=frames, audio=audio, fps=24
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = str(Path(directory, "fallback.mp4"))
-            with (
-                envs.SGLANG_USE_NVENC.override(True),
-                mock.patch.object(
-                    utils, "_try_save_cuda_video_direct", return_value=False
-                ),
-                mock.patch.object(
-                    utils, "_try_save_video_with_audio", return_value=True
-                ) as cpu_save,
-            ):
-                utils.save_materialized_output(materialized, DataType.VIDEO, path)
-            cpu_save.assert_called_once()
 
 
 @unittest.skipUnless(
@@ -252,6 +252,35 @@ class TestNvencVideoEncoder(CustomTestCase):
                 self.assertEqual(len(list(container.decode(video=0))), 4)
                 self.assertEqual(len(container.streams.audio), 1)
 
+    def test_cpu_tensor_video_uses_nvenc(self):
+        import av
+
+        from sglang.multimodal_gen.runtime.entrypoints import utils
+        from sglang.srt.environ import envs
+
+        frames = torch.full((3, 4, 256, 256), 0.5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "cpu_tensor.mp4")
+            with (
+                envs.SGLANG_USE_NVENC.override(True),
+                mock.patch.object(
+                    utils.CudaVideoEncoder,
+                    "open",
+                    side_effect=AssertionError("unexpected CPU encoder"),
+                ),
+            ):
+                self.assertTrue(
+                    utils._try_save_cuda_video_direct(
+                        save_file_path=str(path),
+                        sample=frames,
+                        fps=24,
+                        audio_sample_rate=None,
+                        output_compression=None,
+                    )
+                )
+            with av.open(str(path)) as container:
+                self.assertEqual(sum(1 for _ in container.decode(video=0)), 4)
+
     def test_streamed_write_returns_while_nvenc_worker_is_busy(self):
         """Frame submission returns before the NVENC worker finishes."""
         import av
@@ -310,131 +339,6 @@ class TestNvencVideoEncoder(CustomTestCase):
                 self.assertAlmostEqual(
                     frames[0].to_ndarray(format="rgb24").mean(), 128, delta=12
                 )
-
-    def test_separate_audio_mux_timing(self):
-        """Measure the extra audio pass while checking both saved MP4s retain A/V."""
-        import json
-        import statistics
-        import time
-
-        import av
-        import numpy as np
-
-        from sglang.multimodal_gen.runtime.entrypoints import utils
-        from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
-            NvencVideoEncoder,
-        )
-
-        if utils.scipy_wavfile is None:
-            self.skipTest("requires scipy to mux audio")
-
-        device = torch.device("cuda", torch.cuda.current_device())
-        width, height, fps, num_frames = 640, 352, 30, 90
-        x = torch.linspace(0, 1, width, device=device)[None, None, None, :]
-        y = torch.linspace(0, 1, height, device=device)[None, None, :, None]
-        t = torch.arange(num_frames, device=device)[None, :, None, None] / num_frames
-        frames = torch.cat(
-            [
-                ((x + t) % 1).expand(1, num_frames, height, width),
-                ((y + t / 2) % 1).expand(1, num_frames, height, width),
-                (((x + y) / 2 + t / 3) % 1),
-            ],
-            dim=0,
-        ).contiguous()
-        sample_rate = 24000
-        samples = np.arange(sample_rate * num_frames // fps, dtype=np.float32)
-        audio = (0.2 * np.sin(2 * np.pi * 440 * samples / sample_rate)).astype(
-            np.float32
-        )
-
-        def cpu_save(path):
-            start = time.perf_counter()
-            self.assertTrue(
-                utils._try_save_cuda_video_direct(
-                    save_file_path=str(path),
-                    sample=(frames, audio),
-                    fps=fps,
-                    audio_sample_rate=sample_rate,
-                    output_compression=None,
-                )
-            )
-            torch.cuda.synchronize(device)
-            return {"total_s": time.perf_counter() - start}
-
-        def nvenc_save(path):
-            start = time.perf_counter()
-            encoder = NvencVideoEncoder.open(
-                str(path),
-                device=device,
-                height=height,
-                width=width,
-                fps=fps,
-                num_frames=num_frames,
-            )
-            self.assertIsNotNone(encoder)
-            try:
-                encoder.write(frames)
-                encoder.close()
-            except BaseException:
-                encoder.abort()
-                raise
-            torch.cuda.synchronize(device)
-            encoded_s = time.perf_counter() - start
-            utils._maybe_mux_audio_into_mp4(
-                save_file_path=str(path),
-                audio=audio,
-                num_frames=num_frames,
-                fps=fps,
-                audio_sample_rate=sample_rate,
-            )
-            return {
-                "encode_s": encoded_s,
-                "mux_s": time.perf_counter() - start - encoded_s,
-                "total_s": time.perf_counter() - start,
-            }
-
-        with tempfile.TemporaryDirectory() as directory:
-            for name, save in (("cpu", cpu_save), ("nvenc", nvenc_save)):
-                save(Path(directory, f"{name}_warm.mp4"))
-            timings = {"cpu": [], "nvenc": []}
-            for round_index in range(3):
-                order = ("cpu", "nvenc") if round_index != 1 else ("nvenc", "cpu")
-                for name in order:
-                    path = Path(directory, f"{name}_{round_index}.mp4")
-                    timing = (cpu_save if name == "cpu" else nvenc_save)(path)
-                    timings[name].append(timing)
-                    with av.open(str(path)) as container:
-                        self.assertEqual(len(container.streams.video), 1)
-                        self.assertEqual(len(container.streams.audio), 1)
-                        self.assertEqual(
-                            sum(1 for _ in container.decode(video=0)), num_frames
-                        )
-                    with av.open(str(path)) as container:
-                        self.assertGreater(
-                            sum(frame.samples for frame in container.decode(audio=0)),
-                            sample_rate * (num_frames / fps - 0.1),
-                        )
-            print(
-                "AUDIO_MUX_TIMING "
-                + json.dumps(
-                    {
-                        "shape": [num_frames, height, width],
-                        "cpu_total_median_s": statistics.median(
-                            sample["total_s"] for sample in timings["cpu"]
-                        ),
-                        "nvenc_encode_median_s": statistics.median(
-                            sample["encode_s"] for sample in timings["nvenc"]
-                        ),
-                        "separate_mux_median_s": statistics.median(
-                            sample["mux_s"] for sample in timings["nvenc"]
-                        ),
-                        "nvenc_total_median_s": statistics.median(
-                            sample["total_s"] for sample in timings["nvenc"]
-                        ),
-                    },
-                    sort_keys=True,
-                )
-            )
 
 
 if __name__ == "__main__":

@@ -1385,7 +1385,7 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
         self.assertEqual(
             mux.call_args.kwargs["save_file_path"], "/tmp/cosmos3_audio.mp4"
         )
-        self.assertEqual(len(mux.call_args.kwargs["frames"]), 5)
+        self.assertEqual(mux.call_args.kwargs["num_frames"], 5)
         self.assertEqual(mux.call_args.kwargs["audio_sample_rate"], 24000)
 
         with (

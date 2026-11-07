@@ -115,7 +115,6 @@ class EncodeWhileDecoding:
             width=width,
             fps=self._batch.fps,
             num_frames=self._batch.num_frames or int(frames.shape[1]),
-            audio=self._audio,
             audio_sample_rate=self._audio_sample_rate,
             output_compression=self._batch.output_compression,
             x264_preset=self._batch.x264_preset,
@@ -128,7 +127,8 @@ class EncodeWhileDecoding:
             try:
                 encoder = NvencVideoEncoder.open(
                     self.save_file_path,
-                    **{**kwargs, "audio": None},
+                    audio=None,
+                    **kwargs,
                     # These queued frames are FP32 until the worker converts them.
                     max_queued_frames=max(
                         1, _STREAMED_VIDEO_QUEUE_BYTES // (12 * height * width)
@@ -144,6 +144,7 @@ class EncodeWhileDecoding:
                 logger.debug("Streamed NVENC startup failure", exc_info=True)
         return CudaVideoEncoder.open(
             self.save_file_path,
+            audio=self._audio,
             **kwargs,
             max_queued_frames=_STREAMED_VIDEO_QUEUE_BYTES // (3 * height * width),
         )
