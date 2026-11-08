@@ -1,6 +1,7 @@
 # Copyright (c) 2026, SGLang Team.
 """Pure workload qualification shared by the SM120 FA4 host and kernel."""
 
+from functools import lru_cache
 from typing import Optional
 
 LOW_HD_DECODE_SHAPES = frozenset({(64, 64), (128, 128)})
@@ -88,3 +89,84 @@ def is_low_hd_paged_decode_tile(
         and tile_m in (16, 32)
         and tile_n == LOW_HD_DECODE_TILE_N
     )
+
+
+@lru_cache(maxsize=256)
+def use_rectangular_gqa_tile(
+    *,
+    head_dim: int,
+    head_dim_v: int,
+    batch_size: int,
+    num_head_kv: int,
+    qhead_per_kvhead: int,
+    seqlen_q: Optional[int],
+    seqlen_k: Optional[int],
+    num_sms: Optional[int],
+    pack_gqa: bool,
+    paged_kv: bool,
+    is_causal: bool,
+    is_local: bool,
+) -> bool:
+    """Select M128 only when its measured per-CTA cost wins after splitting.
+
+    The HD128 sweep qualifies packed rows and CTA waves, not a particular
+    batch/head topology. M128 processes twice the rows with eight compute
+    warps; its per-KV-tile cost is about 1.7 times M64's four-warp cost.
+    Require a 5% predicted margin and keep the measured one-wave regime.
+    """
+    if (
+        (head_dim, head_dim_v) != (128, 128)
+        or batch_size is None
+        or num_head_kv is None
+        or qhead_per_kvhead is None
+        or batch_size <= 0
+        or num_head_kv <= 0
+        or qhead_per_kvhead <= 0
+        or seqlen_q is None
+        or seqlen_k is None
+        or seqlen_k < 4096
+        or num_sms is None
+        or num_sms < 128
+        or not pack_gqa
+        or paged_kv
+        or is_causal
+        or is_local
+    ):
+        return False
+    packed_rows = seqlen_q * qhead_per_kvhead
+    if not 512 <= packed_rows <= 2048:
+        return False
+    blocks_128 = batch_size * num_head_kv * ((packed_rows + 127) // 128)
+    if blocks_128 > num_sms:
+        return False
+    blocks_64 = batch_size * num_head_kv * ((packed_rows + 63) // 64)
+    kv_tiles = (seqlen_k + 63) // 64
+
+    def cost(blocks, tile_cost):
+        splits = rectangular_gqa_num_splits(blocks, kv_tiles, num_sms)
+        waves = (blocks * splits + num_sms - 1) // num_sms
+        tiles = (kv_tiles + splits - 1) // splits
+        # Costs are in tenths of an M64 KV iteration. Preserve the merge
+        # penalty used by split selection and compare complete operations.
+        return tile_cost * waves * tiles + 30 * (splits - 1)
+
+    return 105 * cost(blocks_128, 17) < 100 * cost(blocks_64, 10)
+
+
+def rectangular_gqa_num_splits(
+    total_mblocks: int, num_n_blocks: int, num_sms: int
+) -> int:
+    """Balance full CTA waves against FP32 partial-output/merge traffic.
+
+    Keep at least 16 N64 tiles per split. The merge penalty is calibrated in
+    KV-tile units for the qualified HD128, eight-warp kernel; it prevents
+    adding near-empty scheduling waves just to increase parallelism.
+    """
+    max_splits = max(1, min(16, num_n_blocks // 16))
+
+    def cost(splits):
+        waves = (total_mblocks * splits + num_sms - 1) // num_sms
+        tiles = (num_n_blocks + splits - 1) // splits
+        return waves * tiles + 3 * splits
+
+    return min(range(1, max_splits + 1), key=cost)
