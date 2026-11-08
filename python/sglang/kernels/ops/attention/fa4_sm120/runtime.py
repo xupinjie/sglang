@@ -30,6 +30,8 @@ from sglang.kernels.ops.attention.fa4_sm120.policy import (
     LOW_HD_DECODE_MAX_SPLITS,
     LOW_HD_DECODE_SHAPES,
     is_low_hd_paged_decode_tile,
+    rectangular_gqa_num_splits,
+    use_rectangular_gqa_tile,
     visible_decode_seqlen_k,
 )
 from sglang.kernels.ops.attention.flash_attn.cute import fa_logging
@@ -86,6 +88,7 @@ class Sm120ForwardPlan:
     split_kv_blocks_per_cta: int
     transpose_qk_pv: bool
     launch_split_combine_early: bool
+    prefetch_v: bool = False
 
     @property
     def compile_key(self) -> tuple:
@@ -95,6 +98,7 @@ class Sm120ForwardPlan:
             self.split_qk_n,
             self.split_kv_blocks_per_cta,
             self.transpose_qk_pv,
+            self.prefetch_v,
         )
 
 
@@ -488,24 +492,48 @@ class Sm120ForwardPolicy:
             window_size_right=window_size_right,
             tile_n=tile_n,
         )
-        num_splits = cls.select_num_splits(
-            requested_num_splits=requested_num_splits,
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            paged_kv=paged_kv,
-            max_seqlen_q=max_seqlen_q,
-            has_compact_q_groups=has_compact_q_groups,
-            element_size=element_size,
-            packed_q_rows=packed_q_rows,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            total_mblocks=total_mblocks,
-            num_sms=num_sms,
-            num_n_blocks=split_num_n_blocks,
-            device=device,
-            fake_mode=fake_mode,
-            generic_heuristic=generic_heuristic,
-        )
+        if (
+            requested_num_splits < 1
+            and (tile_m, tile_n) == (128, 64)
+            and not has_score_or_mask_mod
+            and use_rectangular_gqa_tile(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                batch_size=batch_size,
+                num_head_kv=num_head_kv,
+                qhead_per_kvhead=(packed_q_rows // max_seqlen_q if max_seqlen_q else 1),
+                seqlen_q=max_seqlen_q,
+                seqlen_k=max_seqlen_k,
+                num_sms=num_sms,
+                pack_gqa=pack_gqa,
+                paged_kv=paged_kv,
+                is_causal=is_causal,
+                is_local=is_local,
+            )
+        ):
+            num_splits = _normalize_num_splits(
+                rectangular_gqa_num_splits(total_mblocks, split_num_n_blocks, num_sms),
+                split_num_n_blocks,
+            )
+        else:
+            num_splits = cls.select_num_splits(
+                requested_num_splits=requested_num_splits,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                paged_kv=paged_kv,
+                max_seqlen_q=max_seqlen_q,
+                has_compact_q_groups=has_compact_q_groups,
+                element_size=element_size,
+                packed_q_rows=packed_q_rows,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                total_mblocks=total_mblocks,
+                num_sms=num_sms,
+                num_n_blocks=split_num_n_blocks,
+                device=device,
+                fake_mode=fake_mode,
+                generic_heuristic=generic_heuristic,
+            )
         is_split_kv = num_splits > 1
         direct_uniform_batch = cls.use_direct_uniform_batch(
             batch_size=batch_size,
@@ -590,6 +618,19 @@ class Sm120ForwardPolicy:
                 is_stream_capturing=is_stream_capturing,
                 is_split_kv=is_split_kv,
             ),
+            # Prefetch has little work to hide in one to three KV tiles, yet
+            # its compiled register live ranges still affect short calls.
+            prefetch_v=(
+                (head_dim, head_dim_v)
+                in ((64, 64), (96, 96), (96, 64), (128, 128), (192, 128))
+                and tile_n == 64
+                and tile_m in (64, 128)
+                and not paged_kv
+                and not is_causal
+                and not is_local
+                and not has_score_or_mask_mod
+                and (split_num_n_blocks + num_splits - 1) // num_splits >= 4
+            ),
         )
 
     @staticmethod
@@ -622,6 +663,7 @@ class Sm120ForwardPolicy:
         window_size_right: Optional[int],
         pack_gqa: bool,
         paged_kv: bool,
+        requested_num_splits: int = 1,
     ) -> Sm120ForwardConfig:
         if has_bias:
             if max(head_dim, head_dim_v) > 128:
@@ -632,6 +674,25 @@ class Sm120ForwardPolicy:
             if tile_mn is not None and tile_mn != (64, 128):
                 raise ValueError("SM120 relative bias requires tile_mn=(64, 128)")
             tile_m, tile_n = 64, 128
+        elif (
+            tile_mn is None
+            and requested_num_splits < 1
+            and use_rectangular_gqa_tile(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                batch_size=num_batch,
+                num_head_kv=num_head_kv,
+                qhead_per_kvhead=qhead_per_kvhead,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                num_sms=num_sms,
+                pack_gqa=pack_gqa,
+                paged_kv=paged_kv,
+                is_causal=is_causal,
+                is_local=is_local,
+            )
+        ):
+            tile_m, tile_n = 128, 64
         elif tile_mn is None:
             tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
                 head_dim,
@@ -1019,6 +1080,7 @@ class Sm120ForwardPolicy:
             paged_kv=paged_kv,
             split_qk_n=plan.split_qk_n,
             split_kv_blocks_per_cta=plan.split_kv_blocks_per_cta,
+            prefetch_v=plan.prefetch_v,
         )
 
 

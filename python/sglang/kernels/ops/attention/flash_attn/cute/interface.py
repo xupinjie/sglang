@@ -742,6 +742,7 @@ def _flash_attn_fwd(
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             tile_mn=tile_mn,
+            requested_num_splits=requested_num_splits,
             has_bias=rel_bias is not None,
             total_q_rows=total_q * num_head,
             num_sms=None if fake_mode else num_SMs,
@@ -1891,7 +1892,10 @@ def _flash_attn_fwd(
 def _get_jit_cache(name: str):
     return get_jit_cache(
         name,
-        source_paths=(os.path.dirname(os.path.abspath(__file__)),),
+        source_paths=(
+            os.path.dirname(os.path.abspath(__file__)),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "fa4_sm120"),
+        ),
         enable_tvm_ffi=True,
     )
 
