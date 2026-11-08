@@ -519,6 +519,22 @@ class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
 
 
+class _FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.FA4_SM120
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        if platform.get_device_capability() != (12, 0):
+            raise ValueError("FA4 SM120 attention requires CUDA SM120.")
+        from sglang.kernels.ops.attention.flash_attention_v4 import (
+            is_flash_attention_v4_available,
+        )
+
+        if not is_flash_attention_v4_available():
+            raise ValueError("FA4 SM120 attention requires nvidia-cutlass-dsl.")
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.fa4_sm120.FlashAttentionSM120Backend"
+
+
 class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA
 
@@ -584,6 +600,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
+        _FlashAttentionSM120BackendResolver,
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,
     )
@@ -813,6 +830,11 @@ class CudaPlatformBase(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
+        if selected_backend == AttentionBackendEnum.FA4_SM120 and dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError("FA4 SM120 attention requires float16 or bfloat16 inputs.")
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()
             if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():

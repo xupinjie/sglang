@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     DeviceCapability,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.test.test_utils import CustomTestCase
 
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -63,6 +64,74 @@ class FakeCudaPlatform(CudaPlatformBase):
     @classmethod
     def get_device_capability(cls, device_id: int = 0):
         return cls.device_capability
+
+
+class TestSM120AttentionSelection(CustomTestCase):
+    def test_architecture_default_fallback_and_explicit_override(self):
+        """The SM120 model preference must preserve other devices and overrides."""
+        selector = "sglang.multimodal_gen.runtime.layers.attention.selector"
+        sm120 = AttentionBackendEnum.FA4_SM120
+        sdpa = AttentionBackendEnum.TORCH_SDPA
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.attention_backend = None
+        server_args._explicit_arg_names = set()
+        self.addCleanup(_cached_get_attn_backend.cache_clear)
+        with (
+            patch(f"{selector}.get_global_server_args", return_value=server_args),
+            patch(f"{selector}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                FakeCudaPlatform,
+            ),
+            patch.object(
+                FakeCudaPlatform, "_resolve_default_attn_backend", return_value=sdpa
+            ),
+        ):
+            for capability, available, dtype, explicit, expected in (
+                ((12, 0), True, torch.bfloat16, None, sm120),
+                ((12, 0), True, torch.bfloat16, sdpa, sdpa),
+                ((12, 0), False, torch.bfloat16, None, sdpa),
+                ((12, 0), True, torch.float32, None, sdpa),
+                ((12, 1), True, torch.bfloat16, None, sdpa),
+                ((10, 0), True, torch.bfloat16, None, sdpa),
+                ((9, 0), True, torch.bfloat16, None, sdpa),
+                ((8, 0), True, torch.bfloat16, None, sdpa),
+            ):
+                with (
+                    self.subTest(
+                        capability=capability,
+                        available=available,
+                        dtype=dtype,
+                        explicit=explicit,
+                    ),
+                    patch.object(
+                        FakeCudaPlatform,
+                        "device_capability",
+                        DeviceCapability(*capability),
+                    ),
+                    patch(
+                        "sglang.kernels.ops.attention.flash_attention_v4.is_flash_attention_v4_available",
+                        return_value=available,
+                    ),
+                ):
+                    _cached_get_attn_backend.cache_clear()
+                    backend = get_attn_backend(
+                        128,
+                        dtype,
+                        supported_attention_backends={sm120, sdpa},
+                        default_attention_backend=sm120,
+                        selected_attention_backend=explicit,
+                        is_cross_attention=True,
+                    )
+                    self.assertEqual(backend.get_enum(), expected)
+            _cached_get_attn_backend.cache_clear()
+            with patch.object(
+                FakeCudaPlatform, "device_capability", DeviceCapability(10, 0)
+            ):
+                with self.assertRaisesRegex(ValueError, "requires CUDA SM120"):
+                    get_attn_backend(
+                        128, torch.bfloat16, selected_attention_backend=sm120
+                    )
 
 
 class TestCudaAttentionBackendSelection(unittest.TestCase):
