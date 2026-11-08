@@ -29,6 +29,7 @@ class AttentionBackendEnum(enum.Enum):
     FA2 = enum.auto()
     FLASHINFER_FA2 = enum.auto()
     FA = enum.auto()
+    FA4_SM120 = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
     TORCH_CUDNN_SDPA = enum.auto()

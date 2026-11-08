@@ -573,6 +573,10 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
             self._supported_attention_backends = self._supported_attention_backends | {
                 AttentionBackendEnum.FLASHINFER_FA2
             }
+        if current_platform.is_cuda() and current_platform.get_device_capability() == (12, 0):
+            self._supported_attention_backends = self._supported_attention_backends | {
+                AttentionBackendEnum.FA4_SM120
+            }
         super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
         self.manifest: CosmosDreamsManifest = load_cosmos_dreams_manifest(hf_config)
         self._validate_causal_arch(hf_config)
