@@ -2238,6 +2238,191 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
     assert all(plan.split_qk_n is expected_split_qk for plan in captured_plans)
 
 
+@pytest.mark.parametrize(
+    "q_len,kv_len,dtype,num_splits,batch_size,num_q_heads,num_kv_heads,prefetch",
+    [
+        pytest.param(224, 14775, torch.bfloat16, 0, 1, 32, 8, True, id="clean"),
+        pytest.param(448, 14999, torch.bfloat16, 0, 1, 32, 8, True, id="denoise"),
+        pytest.param(
+            223, 4097, torch.bfloat16, 0, 1, 32, 8, True, id="partial-q-and-kv-tiles"
+        ),
+        pytest.param(449, 8193, torch.bfloat16, 0, 1, 32, 8, True, id="uneven-splits"),
+        pytest.param(128, 4096, torch.float16, 0, 1, 32, 8, True, id="fp16"),
+        pytest.param(
+            223, 193, torch.bfloat16, 1, 1, 32, 8, True, id="prefetch-four-tiles-tail"
+        ),
+        pytest.param(224, 8192, torch.bfloat16, 0, 2, 32, 8, True, id="batch-two"),
+        pytest.param(320, 12288, torch.bfloat16, 0, 1, 24, 6, True, id="six-kv-heads"),
+        pytest.param(
+            256, 6144, torch.bfloat16, 0, 3, 20, 10, True, id="batch-three-gqa-two"
+        ),
+        pytest.param(192, 12288, torch.float16, 0, 1, 40, 5, True, id="fp16-gqa-eight"),
+        pytest.param(
+            223, 129, torch.bfloat16, 1, 1, 32, 8, False, id="explicit-unsplit-tail"
+        ),
+    ],
+)
+def test_sm120_rectangular_gqa_auto_split_matches_fp64(
+    monkeypatch,
+    q_len,
+    kv_len,
+    dtype,
+    num_splits,
+    batch_size,
+    num_q_heads,
+    num_kv_heads,
+    prefetch,
+):
+    """Check packed Q tails, uneven KV splits and graph reuse against full KV."""
+    from sglang.kernels.ops.attention.flash_attn.cute.interface import _flash_attn_fwd
+
+    prefetched_kernels = []
+    original_make_kernel = Sm120ForwardHost.make_kernel
+
+    def record_kernel(**kwargs):
+        kernel = original_make_kernel(**kwargs)
+        prefetched_kernels.append(kernel._prefetch_v_before_softmax())
+        return kernel
+
+    monkeypatch.setattr(Sm120ForwardHost, "make_kernel", staticmethod(record_kernel))
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", {})
+    # Exercise the core even on SM120 devices too small for automatic selection.
+    tile_mn = (
+        (128, 64)
+        if num_splits == 1
+        or torch.cuda.get_device_properties(0).multi_processor_count < 128
+        else None
+    )
+    kwargs = dict(num_splits=num_splits, tile_mn=tile_mn, pack_gqa=True)
+    torch.manual_seed(2026)
+    projection = torch.randn(
+        (batch_size, q_len, num_q_heads + 2 * num_kv_heads, 128),
+        device="cuda",
+        dtype=dtype,
+    )
+    q = projection[:, :, :num_q_heads]
+    k = torch.randn((batch_size, kv_len, num_kv_heads, 128), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    # Make dropping the last partial KV tile observably wrong.
+    q[:, 0].fill_(4)
+    k[:, -1].fill_(1)
+    indexes = torch.linspace(0, q_len - 1, 8, device="cuda").long()
+    qq = (
+        q[:, indexes]
+        .double()
+        .view(batch_size, 8, num_kv_heads, num_q_heads // num_kv_heads, 128)
+    )
+    score = torch.einsum("bqhgd,bkhd->bhgqk", qq, k.double()) / math.sqrt(128)
+    reference = torch.einsum("bhgqk,bkhd->bqhgd", score.softmax(-1), v.double())
+    reference = reference.reshape(batch_size, 8, num_q_heads, 128)
+
+    out, _ = _flash_attn_fwd(q, k, v, **kwargs)
+    assert prefetched_kernels and all(value == prefetch for value in prefetched_kernels)
+    relative_error = (out[:, indexes].double() - reference).norm() / reference.norm()
+    assert relative_error < 0.01
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_out, _ = _flash_attn_fwd(q, k, v, **kwargs)
+    v.mul_(0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    relative_error = (replay_out[:, indexes].double() - reference * 0.5).norm() / (
+        reference.norm() * 0.5
+    )
+    assert relative_error < 0.01
+
+
+def test_sm120_owned_sources_invalidate_persistent_fa4_cache(tmp_path, monkeypatch):
+    """Changing the owned SM120 source must not reuse a stale compiled object."""
+    from sglang.kernels.jit.cute_aot_cache import _compute_source_fingerprint
+    from sglang.kernels.ops.attention.flash_attn.cute import interface
+
+    cute_dir = tmp_path / "attention" / "flash_attn" / "cute"
+    owned_dir = tmp_path / "attention" / "fa4_sm120"
+    cute_dir.mkdir(parents=True)
+    owned_dir.mkdir()
+    interface_file = cute_dir / "interface.py"
+    interface_file.write_text("# unchanged interface\n")
+    owned_file = owned_dir / "flash_fwd.py"
+    owned_file.write_text("# original kernel\n")
+    factory = interface.get_jit_cache
+    monkeypatch.setattr(interface, "__file__", str(interface_file))
+    monkeypatch.setattr(
+        interface,
+        "get_jit_cache",
+        lambda *args, **kwargs: factory(*args, cache_dir=tmp_path / "cache", **kwargs),
+    )
+    before = interface._get_jit_cache("fwd").cache_path
+    owned_file.write_text("# changed kernel\n")
+    _compute_source_fingerprint.cache_clear()
+    after = interface._get_jit_cache("fwd").cache_path
+    assert before != after
+
+
+@pytest.mark.parametrize(
+    "head_dim,head_dim_v", [(64, 64), (96, 96), (96, 64), (128, 128), (192, 128)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_sm120_prefetch_head_dimensions_and_ragged_tails(
+    monkeypatch, head_dim, head_dim_v, dtype, ragged
+):
+    """Check asymmetric V fragments, partial KV tiles and per-sequence bounds."""
+    from sglang.kernels.ops.attention.flash_attn.cute.interface import _flash_attn_fwd
+
+    kernels = []
+    original_make_kernel = Sm120ForwardHost.make_kernel
+
+    def record_kernel(**kwargs):
+        kernel = original_make_kernel(**kwargs)
+        kernels.append(kernel._prefetch_v_before_softmax())
+        return kernel
+
+    monkeypatch.setattr(Sm120ForwardHost, "make_kernel", staticmethod(record_kernel))
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", {})
+    torch.manual_seed(20261106)
+    q_lengths = (19, 37) if ragged else (37, 37)
+    k_lengths = (129, 257) if ragged else (257, 257)
+    q = [torch.randn(n, 8, head_dim, device="cuda", dtype=dtype) for n in q_lengths]
+    k = [torch.randn(n, 2, head_dim, device="cuda", dtype=dtype) for n in k_lengths]
+    v = [torch.randn(n, 2, head_dim_v, device="cuda", dtype=dtype) for n in k_lengths]
+    sinks = (
+        torch.randn(8, device="cuda", dtype=torch.bfloat16) if head_dim == 128 else None
+    )
+    refs = [_attention_reference(a, b, c, sinks=sinks) for a, b, c in zip(q, k, v)]
+    if ragged:
+        opts = dict(
+            cu_seqlens_q=torch.tensor(
+                [0, q_lengths[0], sum(q_lengths)], device="cuda", dtype=torch.int32
+            ),
+            cu_seqlens_k=torch.tensor(
+                [0, k_lengths[0], sum(k_lengths)], device="cuda", dtype=torch.int32
+            ),
+            max_seqlen_q=max(q_lengths),
+            max_seqlen_k=max(k_lengths),
+        )
+        qq, kk, vv = map(torch.cat, (q, k, v))
+        expected = torch.cat([x[0] for x in refs])
+    else:
+        opts = {}
+        qq, kk, vv = map(torch.stack, (q, k, v))
+        expected = torch.stack([x[0] for x in refs])
+    actual, _ = _flash_attn_fwd(
+        qq, kk, vv, num_splits=1, pack_gqa=True, learnable_sink=sinks, **opts
+    )
+    assert kernels and all(kernels)
+    torch.testing.assert_close(actual.float(), expected, atol=2e-3, rtol=2e-3)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, _ = _flash_attn_fwd(
+            qq, kk, vv, num_splits=1, pack_gqa=True, learnable_sink=sinks, **opts
+        )
+    vv.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output) == 0
+
+
 if __name__ == "__main__":
     import sys
 

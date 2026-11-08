@@ -79,6 +79,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         self,
         *args,
         direct_uniform_batch: bool = False,
+        prefetch_v: bool = True,
         paged_kv: bool = False,
         split_qk_n: bool = False,
         split_kv_blocks_per_cta: int = 0,
@@ -89,6 +90,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
     ):
         super().__init__(*args, **kwargs)
         self.direct_uniform_batch = direct_uniform_batch
+        self.prefetch_v = prefetch_v
         self.paged_kv = paged_kv
         self.split_qk_n = split_qk_n
         self.split_kv_blocks_per_cta = split_kv_blocks_per_cta
@@ -721,6 +723,10 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             # consumer warp own the same 16 rows through both MMA phases.
             return tile_m * 2
         config = (head_dim, head_dim_v, tile_m, tile_n)
+        if not paged_kv and config == (128, 128, 128, 64):
+            # Eight compute warps keep 16 M rows per warp, reducing accumulator
+            # pressure for the packed-GQA tile. The separate DMA warp is retained.
+            return 256
         if config in ((256, 256, 16, 64), (256, 256, 16, 80)):
             return 64
         if config == (256, 256, 32, 64):
@@ -793,6 +799,33 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
 
     def _uses_n_distributed_qk(self) -> bool:
         return self.split_qk_n
+
+    def _prefetch_v_before_softmax(self) -> bool:
+        """Hide V's shared-memory load latency behind online softmax."""
+        return (
+            self.prefetch_v
+            and not self.paged_kv
+            and not self.has_bias
+            and not self.is_causal
+            and not self.is_local
+            and self.score_mod is None
+            and self.mask_mod is None
+            and (
+                self.tile_hdim,
+                self.tile_hdimv,
+                self.tile_m,
+                self.tile_n,
+                self.num_threads,
+            )
+            in (
+                (64, 64, 64, 64, 128),
+                (96, 96, 64, 64, 128),
+                (96, 64, 128, 64, 128),
+                (128, 128, 64, 64, 128),
+                (128, 128, 128, 64, 256),
+                (192, 128, 64, 64, 128),
+            )
+        )
 
     def _num_dma_threads(self) -> int:
         return (
@@ -4330,7 +4363,27 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_copy_params.smem_thr_copy_Q,
             smem_copy_params.smem_thr_copy_K,
         )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         pipeline_k.consumer_release(consumer_state)
+
+        tOrV = None
+        # The first (possibly masked) block needs more address/mask registers.
+        # Restrict prefetch to steady-state blocks to shorten their live ranges.
+        prefetch_v = const_expr(
+            self._prefetch_v_before_softmax() and not is_first_n_block
+        )
+        if const_expr(prefetch_v):
+            v_wait_token = pipeline_v.consumer_try_wait(consumer_state)
+            pipeline_v.consumer_wait(consumer_state, v_wait_token)
+            sV = smem_copy_params.sV[None, None, consumer_state.index]
+            tOrV = mma_params.thr_mma_pv.make_fragment_B(
+                mma_params.thr_mma_pv.partition_B(sV)
+            )
+            v_copy = smem_copy_params.smem_thr_copy_V
+            # Keep the V fragment live through softmax so its LDS instructions
+            # can overlap scalar work, instead of waiting at the start of PV.
+            cute.copy(v_copy, v_copy.partition_S(sV), v_copy.retile(tOrV))
 
         if const_expr(self.has_bias):
             self.apply_sheared_bias(
@@ -4367,15 +4420,27 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
         rP.store(acc_S.load().to(self.dtype))
         tOrP = layout_utils.reshape_acc_to_frgA(rP)
 
-        v_wait_token = pipeline_v.consumer_try_wait(consumer_state)
-        pipeline_v.consumer_wait(consumer_state, v_wait_token)
-        self._gemm_pv_phase_local(
-            mma_params.thr_mma_pv,
-            mma_params.acc_O,
-            tOrP,
-            smem_copy_params.sV[None, None, consumer_state.index],
-            smem_copy_params.smem_thr_copy_V,
-        )
+        if const_expr(prefetch_v):
+            for k in cutlass.range_constexpr(cute.size(tOrP.shape[2])):
+                cute.gemm(
+                    mma_params.thr_mma_pv,
+                    mma_params.acc_O,
+                    tOrP[None, None, k],
+                    tOrV[None, None, k],
+                    mma_params.acc_O,
+                )
+        else:
+            v_wait_token = pipeline_v.consumer_try_wait(consumer_state)
+            pipeline_v.consumer_wait(consumer_state, v_wait_token)
+            self._gemm_pv_phase_local(
+                mma_params.thr_mma_pv,
+                mma_params.acc_O,
+                tOrP,
+                smem_copy_params.sV[None, None, consumer_state.index],
+                smem_copy_params.smem_thr_copy_V,
+            )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         pipeline_v.consumer_release(consumer_state)
         consumer_state.advance()
         return consumer_state

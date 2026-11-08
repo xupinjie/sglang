@@ -23,6 +23,8 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 
 On Blackwell, `dynamic_cudnn_sdpa` keeps FA4 for attention with one side shorter than 128 tokens and the other at least 128 during breakable CUDA graph warmup/capture. In eager execution, `lossless` and `high` requests use cuDNN for these shapes to avoid FA4 host-dispatch overhead; `exact` keeps the reference FA4 route. Switching backends can change floating-point rounding.
 
+On SM120 (compute capability 12.0), Cosmos3 Dreams generation attention, including Cosmos3-Nano-Sim-Bimanual, prefers `fa4_sm120` for FP16/BF16. This backend uses SGLang's SM120 kernel with automatic tile/SplitKV selection and V prefetch. Other devices retain their existing defaults. Explicit backend selections take precedence; use `--attention-backend torch_sdpa` for the SDPA baseline.
+
 ## Backend options
 
 For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBackendEnum`. The table below lists the backends implemented by the built-in platforms. `fa3`/`fa4` are accepted as aliases for `fa`.
@@ -41,6 +43,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`fa4_sm120`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`FA4_SM120`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang's SM120 dense attention, including batched GQA. FP16/BF16; requires <code>nvidia-cutlass-dsl</code>. Uses the existing FA4 custom-op interface. Packed variable-length input is not supported by this diffusion adapter.</td>
+    </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`fa` / `fa3` / `fa4`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`FA`</td>
