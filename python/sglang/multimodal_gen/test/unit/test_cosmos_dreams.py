@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -2536,6 +2537,78 @@ class TestCosmosDreamsPromptAndCanvas(unittest.TestCase):
         torch.testing.assert_close(
             fitted[:, 2:, :], fitted[:, 1:2, :].expand(-1, 6, -1)
         )
+
+
+class TestCosmosDreamsImageCache(CustomTestCase):
+    def test_cpu_cache_content_settings_and_copy_isolation(self):
+        self._check_cache_identity("cpu")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_gpu_cache_identity_without_cpu_pixel_hash(self):
+        self._check_cache_identity("cuda")
+
+    def _check_cache_identity(self, device_type):
+        """GPU digests preserve cache identity without a nested full-image D2H."""
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+        from sglang.multimodal_gen.runtime.cache import conditioning
+
+        class VAE(torch.nn.Module):
+            def __init__(self, device):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.ones((), device=device, dtype=torch.bfloat16)
+                )
+                self.config = SimpleNamespace(
+                    latents_mean=[0, 0, 0], latents_std=[1, 1, 1]
+                )
+                self.calls = 0
+                self.use_tiling = False
+
+            @conditioning.cached_vae_encode
+            def encode(self, pixels):
+                self.calls += 1
+                mean = pixels * (2 if self.use_tiling else 1)
+                return DiagonalGaussianDistribution(
+                    torch.cat([mean, torch.zeros_like(mean)], dim=1)
+                )
+
+        with self.subTest(device=device_type):
+            device = torch.device(device_type)
+            stage = CosmosDreamsPrepareStage.__new__(CosmosDreamsPrepareStage)
+            stage.vae = VAE(device).eval()
+            stage.use_declared_component = lambda **_: nullcontext()
+            geometry = SimpleNamespace(latent_height=8, latent_width=16)
+            cache = conditioning.ConditioningCache(1024 * 1024)
+            image = torch.ones(1, 3, 8, 16, device=device, dtype=torch.bfloat16)
+            pixel_hash = (
+                mock.patch.object(
+                    conditioning,
+                    "_tensor_digest",
+                    side_effect=AssertionError("unexpected CPU tensor hash"),
+                )
+                if device_type == "cuda"
+                else nullcontext()
+            )
+            with torch.no_grad(), cache.scope(), pixel_hash:
+
+                def encode(x):
+                    return stage._encode_image_latent(x, geometry, device)
+
+                torch.testing.assert_close(encode(image), image.unsqueeze(2))
+                hit = encode(image.clone())
+                torch.testing.assert_close(hit, image.unsqueeze(2))
+                self.assertEqual(stage.vae.calls, 1)
+                hit.zero_()
+                torch.testing.assert_close(encode(image), image.unsqueeze(2))
+                self.assertEqual(stage.vae.calls, 1)
+                changed = image.clone()
+                changed[0, 0, -1, -1] = 2
+                torch.testing.assert_close(encode(changed), changed.unsqueeze(2))
+                self.assertEqual(stage.vae.calls, 2)
+                stage.vae.use_tiling = True
+                torch.testing.assert_close(encode(image), image.unsqueeze(2) * 2)
+                self.assertEqual(stage.vae.calls, 3)
 
 
 if __name__ == "__main__":

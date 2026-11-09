@@ -34,6 +34,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     load_unified_normalizer,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -1003,9 +1004,10 @@ class CosmosDreamsPrepareStage(PipelineStage):
         vae_dtype = next(self.vae.parameters()).dtype
         with self.use_declared_component(component_name="vae", module=self.vae):
             with torch.no_grad():
-                latent = self.vae.encode(
-                    image.unsqueeze(2).to(device=device, dtype=vae_dtype)
-                ).mode()
+                pixels = image.unsqueeze(2).to(device=device, dtype=vae_dtype)
+                with use_gpu_conditioning_hash():
+                    posterior = self.vae.encode(pixels)
+                latent = posterior.mode()
         mean = (
             torch.as_tensor(self.vae.config.latents_mean)
             .view(1, -1, 1, 1, 1)
